@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Калькулятор портфеля (MOEX) + CSV</title>
+    <title>MOEX Портфель (JSONP Direct)</title>
     <style>
         body { font-family: 'Segoe UI', sans-serif; margin: 20px; background-color: #f4f4f9; color: #333; }
         .container { max-width: 950px; margin: 0 auto; background: white; padding: 25px; border-radius: 10px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
@@ -31,7 +31,6 @@
         .btn-calc { background-color: #27ae60; }
         .btn-calc:hover { background-color: #219150; }
         
-        /* Кнопка экспорта (по умолчанию скрыта) */
         .btn-csv { background-color: #f39c12; display: none; } 
         .btn-csv:hover { background-color: #d68910; }
 
@@ -52,7 +51,7 @@
 <body>
 
 <div class="container">
-    <h1>Календарь выплат портфеля</h1>
+    <h1>Календарь выплат (Прямой запрос)</h1>
     
     <div id="bonds-list"></div>
 
@@ -66,7 +65,7 @@
 </div>
 
 <script>
-    // Используем window для гарантированного хранения данных
+    // Глобальное хранилище данных
     window.BOND_DATA = [];
 
     document.addEventListener('DOMContentLoaded', () => {
@@ -89,13 +88,45 @@
         container.appendChild(div);
     }
 
+    // === Ядро JSONP (замена fetch) ===
+    function fetchJsonp(url) {
+        return new Promise((resolve, reject) => {
+            // Генерируем уникальное имя функции
+            const callbackName = 'moex_cb_' + Math.round(1000000 * Math.random());
+            
+            // Создаем скрипт
+            const script = document.createElement('script');
+            
+            // Определяем глобальную функцию, которую вызовет биржа
+            window[callbackName] = function(data) {
+                delete window[callbackName]; // Чистим за собой
+                document.body.removeChild(script);
+                resolve(data);
+            };
+
+            // Добавляем параметры к URL
+            // json=jsonp и callback=... — это требования MOEX API
+            const separator = url.indexOf('?') >= 0 ? '&' : '?';
+            script.src = url + separator + 'json=jsonp&callback=' + callbackName;
+            
+            // Обработка ошибок загрузки скрипта
+            script.onerror = function() {
+                delete window[callbackName];
+                document.body.removeChild(script);
+                reject(new Error('JSONP Error: Не удалось загрузить скрипт ' + url));
+            };
+
+            document.body.appendChild(script);
+        });
+    }
+
     async function calculatePortfolio() {
         const outputDiv = document.getElementById('output');
         const btnExport = document.getElementById('btnExport');
         
-        // Сброс данных и интерфейса
         btnExport.style.display = 'none';
-        window.BOND_DATA = []; // Очищаем глобальное хранилище
+        window.BOND_DATA = [];
+        outputDiv.innerHTML = '';
 
         const rows = document.querySelectorAll('.bond-row');
         const inputs = [];
@@ -110,11 +141,12 @@
             return;
         }
 
-        outputDiv.innerHTML = '<p class="loading">Запрос данных по ' + inputs.length + ' бумагам...</p>';
+        outputDiv.innerHTML = '<p class="loading">Запрос данных напрямую с биржи...</p>';
         
         let allPayments = [];
         let errors = [];
 
+        // Запускаем параллельные запросы
         const tasks = inputs.map(item => fetchOneBond(item.isin, item.qty));
 
         try {
@@ -126,46 +158,43 @@
 
             allPayments.sort((a, b) => a.date - b.date);
             
-            // !!! ВАЖНО: Сохраняем данные в window !!!
             window.BOND_DATA = allPayments;
-            console.log("Данные сохранены для экспорта:", window.BOND_DATA.length, "записей");
 
             renderTable(allPayments, errors, outputDiv);
             
-            // Показываем кнопку только если есть данные
             if (allPayments.length > 0) {
                 btnExport.style.display = 'block';
-            } else {
-                outputDiv.innerHTML += '<p style="text-align:center">Нет будущих выплат.</p>';
             }
 
         } catch (e) {
-            outputDiv.innerHTML = `<div class="error">Критическая ошибка: ${e.message}</div>`;
-            console.error(e);
+            outputDiv.innerHTML = `<div class="error">Ошибка: ${e.message}</div>`;
         }
     }
 
     async function fetchOneBond(isin, qty) {
-        const targetUrl = `https://iss.moex.com/iss/securities/${isin}/bondization.json?limit=100`; 
-        const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`;
+        // Прямой адрес MOEX без прокси
+        const url = `https://iss.moex.com/iss/securities/${isin}/bondization.json?limit=100`; 
+        
         const today = new Date();
         today.setHours(0, 0, 0, 0);
 
         try {
-            const response = await fetch(proxyUrl);
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            const json = await response.json();
+            // Используем наш fetchJsonp вместо обычного fetch
+            const json = await fetchJsonp(url);
+            
+            // Структура ответа такая же, как и при обычном JSON
             let bondPayments = [];
             const getColIdx = (columns, name) => columns.findIndex(c => c.toLowerCase() === name.toLowerCase());
 
-            const processSection = (sectionName, dateColName, typeName, cssClass) => {
-                if (json[sectionName] && json[sectionName].data) {
-                    const cols = json[sectionName].columns;
+            // Обработка блоков (Купоны, Амортизация)
+            const processSection = (sectionObj, dateColName, typeName, cssClass) => {
+                if (sectionObj && sectionObj.data) {
+                    const cols = sectionObj.columns;
                     const dateIdx = getColIdx(cols, dateColName);
                     const valIdx = getColIdx(cols, 'value');
 
                     if (dateIdx !== -1) {
-                        json[sectionName].data.forEach(row => {
+                        sectionObj.data.forEach(row => {
                             const dStr = row[dateIdx];
                             if (!dStr) return;
                             const pDate = new Date(dStr);
@@ -185,8 +214,8 @@
                 }
             };
 
-            processSection('coupons', 'coupondate', 'Купон', 'type-coupon');
-            processSection('amortizations', 'amortdate', 'Погашение', 'type-amort');
+            processSection(json.coupons, 'coupondate', 'Купон', 'type-coupon');
+            processSection(json.amortizations, 'amortdate', 'Погашение', 'type-amort');
 
             return { payments: bondPayments, error: null };
         } catch (err) {
@@ -199,7 +228,8 @@
         if (errors.length > 0) html += `<div class="error">${errors.join('<br>')}</div>`;
 
         if (payments.length === 0 && errors.length === 0) {
-            // Если ошибок нет, но и данных нет
+            html += '<p style="text-align:center">Нет будущих выплат по данным бумагам.</p>';
+            container.innerHTML = html;
             return; 
         }
 
@@ -230,11 +260,8 @@
     }
 
     function exportToCsv() {
-        console.log("Попытка экспорта. Данные:", window.BOND_DATA);
-
-        // Проверка через глобальный объект
         if (!window.BOND_DATA || window.BOND_DATA.length === 0) {
-            alert("Нет данных для экспорта. Сначала нажмите 'Рассчитать портфель', и убедитесь, что таблица не пуста.");
+            alert("Нет данных для экспорта.");
             return;
         }
 
@@ -261,7 +288,7 @@
         const link = document.createElement("a");
         const url = URL.createObjectURL(blob);
         link.setAttribute("href", url);
-        link.setAttribute("download", "bonds_schedule.csv");
+        link.setAttribute("download", "moex_bonds_schedule.csv");
         link.style.visibility = 'hidden';
         document.body.appendChild(link);
         link.click();
