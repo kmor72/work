@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Калькулятор портфеля (MOEX) + CSV</title>
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; margin: 20px; background-color: #f4f4f9; color: #333; }
+        .container { max-width: 950px; margin: 0 auto; background: white; padding: 25px; border-radius: 10px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
+        h1 { text-align: center; color: #2c3e50; margin-bottom: 30px; }
+        
+        .bond-row {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 10px;
+            align-items: center;
+            background: #f8f9fa;
+            padding: 10px;
+            border-radius: 5px;
+            border: 1px solid #e9ecef;
+        }
+        .bond-row input[type="text"] { flex: 2; padding: 8px; border: 1px solid #ced4da; border-radius: 4px; }
+        .bond-row input[type="number"] { flex: 1; padding: 8px; border: 1px solid #ced4da; border-radius: 4px; }
+        .btn-remove { background-color: #e74c3c; color: white; border: none; border-radius: 4px; width: 30px; height: 30px; cursor: pointer; font-weight: bold; }
+        .btn-remove:hover { background-color: #c0392b; }
+
+        .controls { display: flex; gap: 15px; margin-top: 20px; margin-bottom: 20px; justify-content: center; flex-wrap: wrap; }
+        .btn-action { padding: 10px 20px; font-size: 16px; border: none; cursor: pointer; border-radius: 5px; color: white; font-weight: 500; }
+        .btn-add { background-color: #3498db; }
+        .btn-add:hover { background-color: #2980b9; }
+        .btn-calc { background-color: #27ae60; }
+        .btn-calc:hover { background-color: #219150; }
+        
+        /* Кнопка экспорта (по умолчанию скрыта) */
+        .btn-csv { background-color: #f39c12; display: none; } 
+        .btn-csv:hover { background-color: #d68910; }
+
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 14px; }
+        th, td { padding: 10px 15px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background-color: #34495e; color: white; position: sticky; top: 0; }
+        tr:hover { background-color: #f1f1f1; }
+        
+        .type-coupon { color: #2980b9; }
+        .type-amort { color: #c0392b; font-weight: bold; }
+        .unknown-value { color: #95a5a6; font-style: italic; }
+        
+        .total-row td { font-weight: bold; background-color: #e8f8f5; border-top: 2px solid #27ae60; font-size: 16px; }
+        .loading { text-align: center; color: #7f8c8d; padding: 20px; }
+        .error { color: #c0392b; padding: 10px; background: #fadbd8; border-radius: 5px; margin-bottom: 10px; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>Календарь выплат портфеля</h1>
+    
+    <div id="bonds-list"></div>
+
+    <div class="controls">
+        <button class="btn-action btn-add" id="btnAddRow">+ Добавить облигацию</button>
+        <button class="btn-action btn-calc" id="btnCalc">Рассчитать портфель</button>
+        <button class="btn-action btn-csv" id="btnExport">💾 Скачать Excel (CSV)</button>
+    </div>
+
+    <div id="output"></div>
+</div>
+
+<script>
+    // Используем window для гарантированного хранения данных
+    window.BOND_DATA = [];
+
+    document.addEventListener('DOMContentLoaded', () => {
+        addBondRow('RU000A107UU5', 10);
+        document.getElementById('btnAddRow').addEventListener('click', () => addBondRow());
+        document.getElementById('btnCalc').addEventListener('click', calculatePortfolio);
+        document.getElementById('btnExport').addEventListener('click', exportToCsv);
+    });
+
+    function addBondRow(defaultIsin = '', defaultQty = '') {
+        const container = document.getElementById('bonds-list');
+        const div = document.createElement('div');
+        div.className = 'bond-row';
+        div.innerHTML = `
+            <input type="text" class="input-isin" placeholder="ISIN (напр. RU000...)" value="${defaultIsin}">
+            <input type="number" class="input-qty" placeholder="Кол-во (шт)" min="1" value="${defaultQty}">
+            <button class="btn-remove" title="Удалить строку">&times;</button>
+        `;
+        div.querySelector('.btn-remove').addEventListener('click', () => div.remove());
+        container.appendChild(div);
+    }
+
+    async function calculatePortfolio() {
+        const outputDiv = document.getElementById('output');
+        const btnExport = document.getElementById('btnExport');
+        
+        // Сброс данных и интерфейса
+        btnExport.style.display = 'none';
+        window.BOND_DATA = []; // Очищаем глобальное хранилище
+
+        const rows = document.querySelectorAll('.bond-row');
+        const inputs = [];
+        rows.forEach(row => {
+            const isin = row.querySelector('.input-isin').value.trim();
+            const qty = parseInt(row.querySelector('.input-qty').value);
+            if (isin && qty > 0) inputs.push({ isin, qty });
+        });
+
+        if (inputs.length === 0) {
+            alert('Введите хотя бы один ISIN и количество!');
+            return;
+        }
+
+        outputDiv.innerHTML = '<p class="loading">Запрос данных по ' + inputs.length + ' бумагам...</p>';
+        
+        let allPayments = [];
+        let errors = [];
+
+        const tasks = inputs.map(item => fetchOneBond(item.isin, item.qty));
+
+        try {
+            const results = await Promise.all(tasks);
+            results.forEach(res => {
+                if (res.error) errors.push(res.error);
+                else allPayments = allPayments.concat(res.payments);
+            });
+
+            allPayments.sort((a, b) => a.date - b.date);
+            
+            // !!! ВАЖНО: Сохраняем данные в window !!!
+            window.BOND_DATA = allPayments;
+            console.log("Данные сохранены для экспорта:", window.BOND_DATA.length, "записей");
+
+            renderTable(allPayments, errors, outputDiv);
+            
+            // Показываем кнопку только если есть данные
+            if (allPayments.length > 0) {
+                btnExport.style.display = 'block';
+            } else {
+                outputDiv.innerHTML += '<p style="text-align:center">Нет будущих выплат.</p>';
+            }
+
+        } catch (e) {
+            outputDiv.innerHTML = `<div class="error">Критическая ошибка: ${e.message}</div>`;
+            console.error(e);
+        }
+    }
+
+    async function fetchOneBond(isin, qty) {
+        const targetUrl = `https://iss.moex.com/iss/securities/${isin}/bondization.json?limit=100`; 
+        const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`;
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+
+        try {
+            const response = await fetch(proxyUrl);
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const json = await response.json();
+            let bondPayments = [];
+            const getColIdx = (columns, name) => columns.findIndex(c => c.toLowerCase() === name.toLowerCase());
+
+            const processSection = (sectionName, dateColName, typeName, cssClass) => {
+                if (json[sectionName] && json[sectionName].data) {
+                    const cols = json[sectionName].columns;
+                    const dateIdx = getColIdx(cols, dateColName);
+                    const valIdx = getColIdx(cols, 'value');
+
+                    if (dateIdx !== -1) {
+                        json[sectionName].data.forEach(row => {
+                            const dStr = row[dateIdx];
+                            if (!dStr) return;
+                            const pDate = new Date(dStr);
+                            if (pDate >= today) {
+                                bondPayments.push({
+                                    isin: isin,
+                                    date: pDate,
+                                    oneValue: row[valIdx],
+                                    totalValue: row[valIdx] !== null ? row[valIdx] * qty : null,
+                                    type: typeName,
+                                    cssClass: cssClass,
+                                    qty: qty
+                                });
+                            }
+                        });
+                    }
+                }
+            };
+
+            processSection('coupons', 'coupondate', 'Купон', 'type-coupon');
+            processSection('amortizations', 'amortdate', 'Погашение', 'type-amort');
+
+            return { payments: bondPayments, error: null };
+        } catch (err) {
+            return { payments: [], error: `Ошибка ISIN ${isin}: ${err.message}` };
+        }
+    }
+
+    function renderTable(payments, errors, container) {
+        let html = '';
+        if (errors.length > 0) html += `<div class="error">${errors.join('<br>')}</div>`;
+
+        if (payments.length === 0 && errors.length === 0) {
+            // Если ошибок нет, но и данных нет
+            return; 
+        }
+
+        let totalSum = 0;
+        let hasUnknowns = false;
+
+        let tableRows = payments.map(p => {
+            const dateStr = p.date.toLocaleDateString('ru-RU');
+            let valStr;
+            if (p.totalValue === null) {
+                valStr = '<span class="unknown-value">Определяется</span>';
+                hasUnknowns = true;
+            } else {
+                valStr = p.totalValue.toLocaleString('ru-RU', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+                totalSum += p.totalValue;
+            }
+            return `<tr><td>${dateStr}</td><td><strong>${p.isin}</strong> (${p.qty} шт)</td><td class="${p.cssClass}">${p.type}</td><td>${valStr} ₽</td></tr>`;
+        }).join('');
+
+        const totalLabel = hasUnknowns ? "Итого (гарантированные):" : "Итого поступлений:";
+        
+        if (payments.length > 0) {
+            html += `<table><thead><tr><th>Дата</th><th>Бумага</th><th>Тип</th><th>Сумма (Всего)</th></tr></thead>
+                 <tbody>${tableRows}<tr class="total-row"><td colspan="3" style="text-align:right">${totalLabel}</td><td>${totalSum.toLocaleString('ru-RU', {minimumFractionDigits: 2})} ₽</td></tr></tbody></table>`;
+        }
+        
+        container.innerHTML = html;
+    }
+
+    function exportToCsv() {
+        console.log("Попытка экспорта. Данные:", window.BOND_DATA);
+
+        // Проверка через глобальный объект
+        if (!window.BOND_DATA || window.BOND_DATA.length === 0) {
+            alert("Нет данных для экспорта. Сначала нажмите 'Рассчитать портфель', и убедитесь, что таблица не пуста.");
+            return;
+        }
+
+        let csvContent = "Дата;ISIN;Количество;Тип выплаты;Сумма за шт;Общая сумма\n";
+
+        window.BOND_DATA.forEach(row => {
+            const dateStr = row.date.toLocaleDateString('ru-RU');
+            const oneVal = row.oneValue !== null ? row.oneValue.toString().replace('.', ',') : "0";
+            const totalVal = row.totalValue !== null ? row.totalValue.toString().replace('.', ',') : "Определяется";
+
+            const csvRow = [
+                dateStr,
+                row.isin,
+                row.qty,
+                row.type,
+                oneVal,
+                totalVal
+            ].join(";"); 
+
+            csvContent += csvRow + "\n";
+        });
+
+        const blob = new Blob(["\ufeff", csvContent], { type: "text/csv;charset=utf-8;" });
+        const link = document.createElement("a");
+        const url = URL.createObjectURL(blob);
+        link.setAttribute("href", url);
+        link.setAttribute("download", "bonds_schedule.csv");
+        link.style.visibility = 'hidden';
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+    }
+</script>
+
+</body>
+</html>
